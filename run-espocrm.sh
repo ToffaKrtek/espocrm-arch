@@ -43,6 +43,13 @@ NGINX_DIR="$SCRIPT_DIR/nginx-conf"
 CERTBOT_DIR="$SCRIPT_DIR/certbot"
 NGINX_CONF="$NGINX_DIR/default.conf"
 
+# Точки монтирования в compose пишем относительными путями: compose резолвит их
+# рядом со своим файлом, поэтому сгенерированный docker-compose.yml остаётся
+# переносимым между машинами/каталогами (в отличие от абсолютных путей).
+NGINX_MOUNT="./nginx-conf"
+CERTBOT_CONF_MOUNT="./certbot/conf"
+CERTBOT_WWW_MOUNT="./certbot/www"
+
 DB_SVC="espocrm-db"
 APP_SVC="espocrm"
 NGINX_SVC="espocrm-proxy"
@@ -212,19 +219,23 @@ write_env_file() {
   admin_user="$(read_env_var ESPOCRM_ADMIN_USERNAME)"; [[ -z "$admin_user" ]] && admin_user="admin"
   admin_pass="$(read_env_var ESPOCRM_ADMIN_PASSWORD)"; [[ -z "$admin_pass" ]] && admin_pass="$(gen_password)"
 
-  umask 077
-  {
-    echo "# Автогенерировано run-espocrm.sh $(date -Is)"
-    echo "# ВНИМАНИЕ: файл содержит секреты, не коммитить в git."
-    echo "MARIADB_ROOT_PASSWORD=${root}"
-    echo "MARIADB_DATABASE=espocrm"
-    echo "MARIADB_USER=espocrm"
-    echo "MARIADB_PASSWORD=${db_pass}"
-    echo "ESPOCRM_ADMIN_USERNAME=${admin_user}"
-    echo "ESPOCRM_ADMIN_PASSWORD=${admin_pass}"
-    echo "ESPOCRM_SITE_URL=${SITE_URL}"
-    echo "ESPOCRM_WEBSOCKET_URL=${WEBSOCKET_URL}"
-  } > "$ENV_FILE"
+  # umask только на время записи: иначе он «утечёт» дальше по скрипту и каталоги
+  # nginx/certbot создадутся с правами 077, которые nginx-worker уже не прочитает.
+  (
+    umask 077
+    {
+      echo "# Автогенерировано run-espocrm.sh $(date -Is)"
+      echo "# ВНИМАНИЕ: файл содержит секреты, не коммитить в git."
+      echo "MARIADB_ROOT_PASSWORD=${root}"
+      echo "MARIADB_DATABASE=espocrm"
+      echo "MARIADB_USER=espocrm"
+      echo "MARIADB_PASSWORD=${db_pass}"
+      echo "ESPOCRM_ADMIN_USERNAME=${admin_user}"
+      echo "ESPOCRM_ADMIN_PASSWORD=${admin_pass}"
+      echo "ESPOCRM_SITE_URL=${SITE_URL}"
+      echo "ESPOCRM_WEBSOCKET_URL=${WEBSOCKET_URL}"
+    } > "$ENV_FILE"
+  )
   chmod 600 "$ENV_FILE"
 
   MARIADB_ROOT_PASSWORD="$root"
@@ -448,17 +459,20 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ${NGINX_DIR}:/etc/nginx/conf.d:ro
-      - ${CERTBOT_DIR}/conf:/etc/letsencrypt:ro
-      - ${CERTBOT_DIR}/www:/var/www/certbot:ro
+      - ${NGINX_MOUNT}:/etc/nginx/conf.d:ro
+      - ${CERTBOT_CONF_MOUNT}:/etc/letsencrypt:ro
+      - ${CERTBOT_WWW_MOUNT}:/var/www/certbot:ro
 
   certbot:
     image: certbot/certbot:latest
     container_name: espocrm-certbot
     volumes:
-      - ${CERTBOT_DIR}/conf:/etc/letsencrypt
-      - ${CERTBOT_DIR}/www:/var/www/certbot
-    entrypoint: ["/bin/sh", "-c", "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h; done"]
+      - ${CERTBOT_CONF_MOUNT}:/etc/letsencrypt
+      - ${CERTBOT_WWW_MOUNT}:/var/www/certbot
+    # Только продление: первый renew — через 12ч, чтобы не держать lock в
+    # /etc/letsencrypt во время выпуска сертификата. Сам выпуск делается
+    # отдельным запуском с --entrypoint certbot (см. issue_certificate).
+    entrypoint: ["/bin/sh", "-c", "trap exit TERM; while :; do sleep 12h; certbot renew --webroot -w /var/www/certbot --quiet; done"]
 
 volumes:
   espocrm-db:
@@ -592,11 +606,20 @@ wait_healthy() {
 }
 
 # ---------------------------------------------------------------------------
+# Каталоги, разделяемые с контейнерами (должны читаться непривилегированным
+# процессом внутри nginx/certbot, поэтому world-readable в отличие от .env)
+# ---------------------------------------------------------------------------
+prepare_shared_dirs() {
+  mkdir -p "$NGINX_DIR" "$CERTBOT_DIR/conf" "$CERTBOT_DIR/www"
+  chmod 755 "$CERTBOT_DIR" "$CERTBOT_DIR/conf" "$CERTBOT_DIR/www" "$NGINX_DIR"
+}
+
+# ---------------------------------------------------------------------------
 # Выпуск сертификата Let's Encrypt
 # ---------------------------------------------------------------------------
 issue_certificate() {
   info "Выпуск SSL-сертификата для '${DOMAIN}'..."
-  mkdir -p "$CERTBOT_DIR/conf" "$CERTBOT_DIR/www"
+  prepare_shared_dirs
 
   local email_args=(-n --agree-tos --keep-until-expiring)
   if [[ -n "$EMAIL" ]]; then
@@ -605,7 +628,10 @@ issue_certificate() {
     email_args+=(--register-unsafely-without-email)
   fi
 
-  if "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm --no-deps certbot \
+  # --entrypoint обязателен: в compose у certbot свой entrypoint-цикл продления,
+  # иначе 'run certbot certonly ...' ушёл бы в $0 команды 'sh -c' и выпуск не выполнился.
+  if "${COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm --no-deps \
+       --entrypoint certbot certbot \
        certonly --webroot -w /var/www/certbot -d "$DOMAIN" "${email_args[@]}"; then
     ok "Сертификат получен"
     return 0
@@ -694,7 +720,7 @@ main() {
   check_ports
 
   if [[ "$SSL_ENABLED" == true ]]; then
-    mkdir -p "$CERTBOT_DIR/conf" "$CERTBOT_DIR/www"
+    prepare_shared_dirs
     write_nginx_bootstrap
 
     info "Запуск контейнеров (nginx временно на HTTP для выпуска сертификата)..."
